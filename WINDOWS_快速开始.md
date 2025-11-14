@@ -91,3 +91,4 @@ port = 8765  # 改成其他端口，如 9000
 - 修改 `server.py` 调整模型大小（tiny/base/small/medium）
 - 开发自己的客户端（参考 `test_client.py`）
 - 集成到你的应用中
+conda activate stt

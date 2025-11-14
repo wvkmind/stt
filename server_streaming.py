@@ -29,8 +29,8 @@ MODEL = None
 def init_model():
     """初始化 Whisper 模型"""
     global MODEL, CC
-    logger.info("正在加载 Whisper 模型...")
-    MODEL = WhisperModel("base", device="cpu", compute_type="int8")
+    logger.info("正在加载 Whisper 模型 (medium)...")
+    MODEL = WhisperModel("medium", device="cpu", compute_type="int8")
     logger.info("模型加载完成")
     
     # 初始化繁简转换
@@ -42,33 +42,50 @@ def init_model():
         logger.warning("安装命令: pip install opencc-python-reimplemented")
 
 class AudioBuffer:
-    """音频缓冲区，用于流式处理"""
-    def __init__(self, sample_rate=16000, channels=1, sample_width=2):
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.sample_width = sample_width
-        self.buffer = bytearray()
-        self.chunk_duration = 3  # 每 3 秒转录一次
-        self.chunk_size = sample_rate * channels * sample_width * self.chunk_duration
+    """音频缓冲区，分段转录"""
+    def __init__(self):
+        self.buffer = bytearray()  # 当前段的音频数据
+        self.all_text = []  # 保存所有转录结果
+        self.last_data_time = None  # 上次收到数据的时间
+        self.min_data_size = 30 * 1024  # 最小 30KB 才开始转录
+        self.silence_threshold = 1.0  # 静音阈值（秒）
         
     def add_data(self, data: bytes):
         """添加音频数据"""
+        import time
         self.buffer.extend(data)
+        self.last_data_time = time.time()
         
-    def has_chunk(self):
-        """是否有足够的数据进行转录"""
-        return len(self.buffer) >= self.chunk_size
+    def should_transcribe(self):
+        """是否应该转录（检测停顿）"""
+        import time
+        
+        # 数据太少，不转录
+        if len(self.buffer) < self.min_data_size:
+            return False
+        
+        # 检测停顿
+        if self.last_data_time:
+            silence_duration = time.time() - self.last_data_time
+            if silence_duration >= self.silence_threshold:
+                logger.info(f"🔇 停顿 {silence_duration:.1f}秒")
+                return True
+        
+        return False
     
-    def get_chunk(self):
-        """获取一个音频块"""
-        if not self.has_chunk():
+    def get_segment_for_transcribe(self):
+        """获取当前段数据并清空（分段转录）"""
+        if len(self.buffer) == 0:
             return None
-        
-        chunk = bytes(self.buffer[:self.chunk_size])
-        self.buffer = self.buffer[self.chunk_size:]
+        chunk = bytes(self.buffer)
+        self.buffer.clear()  # 清空，准备下一段
         return chunk
     
-    def get_remaining(self):
+    def has_data(self):
+        """是否有数据"""
+        return len(self.buffer) > 0
+    
+    def get_remaining_data(self):
         """获取剩余数据"""
         if len(self.buffer) == 0:
             return None
@@ -76,13 +93,14 @@ class AudioBuffer:
         self.buffer.clear()
         return chunk
     
-    def save_to_wav(self, data: bytes, filename: str):
-        """保存为 WAV 文件"""
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(self.sample_width)
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(data)
+    def add_text(self, text: str):
+        """添加转录结果"""
+        if text:
+            self.all_text.append(text)
+    
+    def get_full_text(self):
+        """获取完整转录结果"""
+        return "".join(self.all_text)
 
 def to_simplified_chinese(text: str) -> str:
     """转换为简体中文"""
@@ -97,21 +115,26 @@ def to_simplified_chinese(text: str) -> str:
             return text
     return text
 
-async def transcribe_chunk(audio_data: bytes, buffer: AudioBuffer, language="zh"):
-    """转录音频块"""
+async def transcribe_chunk(audio_data: bytes, language="zh"):
+    """转录音频块（支持任意格式）"""
     try:
-        # 保存临时文件
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            buffer.save_to_wav(audio_data, tmp.name)
+        # 保存临时文件（让 faster-whisper 自动处理格式）
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+            tmp.write(audio_data)
             tmp_path = tmp.name
         
-        # 转录
+        logger.info(f"开始转录 {len(audio_data)} 字节的音频数据")
+        
+        # 转录（faster-whisper 内部会用 ffmpeg 转换格式）
         segments, info = MODEL.transcribe(
             tmp_path,
             language=language,
-            beam_size=3,  # 降低 beam_size 提高速度
+            beam_size=5,  # 提高准确率
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=300)
+            vad_parameters=dict(
+                min_silence_duration_ms=300,
+                threshold=0.3  # 降低 VAD 阈值，减少过滤
+            )
         )
         
         # 收集结果
@@ -126,11 +149,42 @@ async def transcribe_chunk(audio_data: bytes, buffer: AudioBuffer, language="zh"
         text = text.strip()
         text = to_simplified_chinese(text)
         
+        logger.info(f"转录完成: {text}")
         return text
     
     except Exception as e:
-        logger.error(f"转录错误: {e}")
+        logger.error(f"转录错误: {e}", exc_info=True)
         return None
+
+async def periodic_transcribe(buffer, websocket, interval=0.5):
+    """定时检查任务 - 检测停顿后分段转录"""
+    transcribing = False
+    
+    while True:
+        await asyncio.sleep(interval)
+        
+        if transcribing:
+            continue
+        
+        if buffer.should_transcribe():
+            transcribing = True
+            segment = buffer.get_segment_for_transcribe()
+            logger.info(f"🎙️ 转录段 {len(segment)} 字节")
+            
+            try:
+                text = await transcribe_chunk(segment)
+                if text:
+                    buffer.add_text(text)
+                    full_text = buffer.get_full_text()
+                    await websocket.send(json.dumps({
+                        "type": "partial",
+                        "text": full_text,
+                        "is_final": False
+                    }))
+                    logger.info(f"✅ 段: {text}")
+                    logger.info(f"📝 累积: {full_text}")
+            finally:
+                transcribing = False
 
 async def handle_streaming_client(websocket, path):
     """处理流式客户端连接"""
@@ -139,6 +193,7 @@ async def handle_streaming_client(websocket, path):
     
     buffer = AudioBuffer()
     session_active = False
+    transcribe_task = None
     
     try:
         await websocket.send(json.dumps({
@@ -152,24 +207,9 @@ async def handle_streaming_client(websocket, path):
                 # 接收音频流数据
                 if not session_active:
                     session_active = True
-                    logger.info(f"客户端 {client_id} 开始流式传输")
+                    logger.info(f"✅ 开始接收音频流")
                 
                 buffer.add_data(message)
-                
-                # 当缓冲区有足够数据时，进行转录
-                while buffer.has_chunk():
-                    chunk = buffer.get_chunk()
-                    
-                    # 异步转录，不阻塞接收
-                    text = await transcribe_chunk(chunk, buffer)
-                    
-                    if text:
-                        await websocket.send(json.dumps({
-                            "type": "partial",
-                            "text": text,
-                            "is_final": False
-                        }))
-                        logger.info(f"部分结果: {text}")
             
             elif isinstance(message, str):
                 # 接收控制命令
@@ -181,42 +221,67 @@ async def handle_streaming_client(websocket, path):
                         # 开始新会话
                         buffer = AudioBuffer()
                         session_active = True
+                        
+                        # 启动定时转录任务
+                        transcribe_task = asyncio.create_task(
+                            periodic_transcribe(buffer, websocket, interval=3.0)
+                        )
+                        
                         await websocket.send(json.dumps({
                             "type": "session_started"
                         }))
-                        logger.info(f"客户端 {client_id} 开始新会话")
+                        logger.info(f"✅ 开始新会话")
                     
                     elif cmd == "stop":
-                        # 结束会话，处理剩余数据
-                        remaining = buffer.get_remaining()
-                        if remaining:
-                            text = await transcribe_chunk(remaining, buffer)
+                        # 停止定时任务
+                        if transcribe_task:
+                            transcribe_task.cancel()
+                            try:
+                                await transcribe_task
+                            except asyncio.CancelledError:
+                                pass
+                        
+                        # 处理剩余数据
+                        remaining = buffer.get_remaining_data()
+                        if remaining and len(remaining) > 10240:
+                            logger.info(f"🔄 最后一段 {len(remaining)} 字节")
+                            text = await transcribe_chunk(remaining)
                             if text:
-                                await websocket.send(json.dumps({
-                                    "type": "final",
-                                    "text": text,
-                                    "is_final": True
-                                }))
-                                logger.info(f"最终结果: {text}")
+                                buffer.add_text(text)
+                                logger.info(f"✅ 段: {text}")
+                        
+                        # 返回完整结果
+                        full_text = buffer.get_full_text()
+                        logger.info(f"📝 完整: {full_text}")
+                        
+                        await websocket.send(json.dumps({
+                            "type": "final",
+                            "text": full_text,
+                            "is_final": True
+                        }))
                         
                         session_active = False
                         await websocket.send(json.dumps({
                             "type": "session_ended"
                         }))
-                        logger.info(f"客户端 {client_id} 结束会话")
+                        logger.info(f"✅ 结束")
                     
                     elif cmd == "ping":
                         await websocket.send(json.dumps({
                             "type": "pong"
                         }))
                     
-                except json.JSONDecodeError:
-                    logger.warning(f"无效的 JSON: {message}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"⚠️ 无效 JSON: {e}")
     
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"客户端 {client_id} 断开连接")
+        if transcribe_task:
+            transcribe_task.cancel()
     except Exception as e:
-        logger.error(f"处理客户端 {client_id} 时出错: {e}")
+        logger.error(f"处理客户端 {client_id} 时出错: {e}", exc_info=True)
+        if transcribe_task:
+            transcribe_task.cancel()
 
 async def main():
     """启动服务"""
